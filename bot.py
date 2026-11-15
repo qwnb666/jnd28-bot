@@ -4,6 +4,8 @@ import os
 import json
 import math
 import random
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from decimal import Decimal, getcontext, ROUND_HALF_UP
 from collections import Counter, defaultdict
 
@@ -40,7 +42,7 @@ def charity_compute(a, b, c, S):
         steps += 1
     return int(val), steps
 
-# ══════════ 异步数据拉取（极速版） ══════════
+# ══════════ 极速异步数据拉取 ══════════
 async def fetch_history():
     async with httpx.AsyncClient(timeout=10.0) as client:
         url = API_BASE.format(20)
@@ -259,15 +261,35 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += "\n\n⚠️ 基准不变，算法不提高长期命中率"
     await q.edit_message_text(text)
 
+
+# ══════════ 适配 Render 的假 Web 服务器 ══════════
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+def run_dummy_server():
+    port = int(os.environ.get("PORT", "8080"))
+    server = HTTPServer(('0.0.0.0', port), SimpleHandler)
+    server.serve_forever()
+
+# ══════════ 主入口 ══════════
 def main():
     token = os.environ.get("BOT_TOKEN", "").strip()
     if not token:
         print("错误：未找到 BOT_TOKEN 环境变量！")
         return
+        
+    # 启动假 Web 服务器（在后台运行，防止 Render 报无端口错误）
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+    
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
     print("Bot 已启动！")
+    
+    # 启动 Telegram 机器人
     app.run_polling()
 
 if __name__ == "__main__":
