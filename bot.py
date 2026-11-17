@@ -18,12 +18,16 @@ from telegram.ext import (
 )
 
 # ==================== 配置 ====================
-API_URL = "https://pc28.help/api/kj.json?nbr=300"
+# 增加了备用接口，如果主接口挂了自动切换
+API_URLS = [
+    "https://pc28.help/api/kj.json?nbr=300",
+    "https://jnd28.pw/api/kj?limit=300"
+]
 HISTORY_LEN = 300
 BACKTEST_N = 100
 ALPHA = 20.0
 
-# ⚠️ 替换成你的频道用户名（带@） ⚠️
+# ⚠️ 你的频道
 CHANNEL_USERNAME = "@qw888nb" 
 
 # ============================================================
@@ -43,24 +47,15 @@ def build_theoretical_dist() -> Dict[int, float]:
 
 THEORY = build_theoretical_dist()
 
-# ============================================================
-#  单期开奖数据类
-# ============================================================
 class Draw:
-    def __init__(self, period: int, nums: List[int], total: int,
-                 pattern: str, edge: str = "中", remainder: str = "", shape: str = "杂六"):
+    def __init__(self, period: int, nums: List[int], total: int, pattern: str, shape: str = "杂六"):
         self.period = period
         self.a, self.b, self.c = nums[0], nums[1], nums[2]
         self.nums = nums
         self.total = total
         self.pattern = pattern
-        self.edge = edge
-        self.remainder = remainder
         self.shape = shape
 
-# ============================================================
-#  工具函数
-# ============================================================
 def detect_shape(nums: List[int]) -> str:
     a, b, c = nums[0], nums[1], nums[2]
     if a == b == c: return '豹子'
@@ -80,9 +75,6 @@ def get_pattern_totals(pattern: str) -> List[int]:
     elif pattern == "小单": return [1, 3, 5, 7, 9, 11, 13]
     return [10]
 
-# ============================================================
-#  V4.4 预测器
-# ============================================================
 class V44Predictor:
     def __init__(self, history: List[Draw]):
         self.history = history
@@ -118,13 +110,11 @@ class V44Predictor:
 
         sizes = [r.pattern[0] for r in self.history[-4:]]
         odds = [r.pattern[1] for r in self.history[-4:]]
-        size_streak = len(sizes) >= 4 and len(set(sizes)) == 1
-        odd_streak = len(odds) >= 4 and len(set(odds)) == 1
-        if size_streak:
+        if len(sizes) >= 4 and len(set(sizes)) == 1:
             for p in scores:
                 if p[0] == sizes[-1]: scores[p] *= 0.85
                 else: scores[p] *= 1.08
-        if odd_streak:
+        if len(odds) >= 4 and len(set(odds)) == 1:
             for p in scores:
                 if p[1] == odds[-1]: scores[p] *= 0.95
                 else: scores[p] *= 1.05
@@ -158,15 +148,8 @@ class V44Predictor:
         candidates = get_pattern_totals(main_pattern)
         best_total = max(candidates, key=lambda t: posterior.get(t, 0))
         top5 = sorted(posterior.items(), key=lambda x: -x[1])[:5]
-        top5_totals = [t for t, _ in top5]
-        return {
-            'total': best_total, 'pattern': main_pattern,
-            'top5_totals': top5_totals, 'posterior': {t: round(posterior[t], 4) for t in range(1, 28)}
-        }
+        return {'total': best_total, 'pattern': main_pattern, 'top5_totals': [t for t, _ in top5], 'posterior': {t: round(posterior[t], 4) for t in range(1, 28)}}
 
-# ============================================================
-#  特码选择 + 双组
-# ============================================================
 def pick_two_totals(pattern: str, main_total: int, posterior: Dict[int, float]) -> List[int]:
     candidates = get_pattern_totals(pattern)
     if not candidates: return [main_total]
@@ -199,33 +182,39 @@ def build_two_group(main_pattern: str, main_total: int, posterior: Dict[int, flo
         "group_text": f"双组推荐：{main_pattern}({'、'.join(map(str, main_totals))}) / {alt}({'、'.join(map(str, alt_totals))})"
     }
 
-# ============================================================
-#  数据获取与转换
-# ============================================================
 def fetch_history_data() -> List[Dict]:
-    try:
-        res = requests.get(API_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=15, verify=False)
-        data = json.loads(res.text)
-        out = []
-        for item in data["data"][:HISTORY_LEN]:
-            period = int(item["nbr"])
-            n1, n2, n3 = map(int, item["number"].split("+"))
-            sum_s = int(item["num"])
-            pat = get_pattern_by_sum(sum_s)
-            shape = detect_shape([n1, n2, n3])
-            out.append({"period": period, "a": n1, "b": n2, "c": n3, "total": sum_s, "pattern": pat, "shape": shape})
-        out.sort(key=lambda x: x["period"])
-        return out
-    except Exception as e:
-        print(f"获取数据失败: {e}")
-        return []
+    for url in API_URLS:
+        try:
+            res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10, verify=False)
+            data = json.loads(res.text)
+            
+            # 兼容两种API的返回格式
+            raw_data = data.get("data", [])
+            if not raw_data: continue
+            
+            out = []
+            for item in raw_data[:HISTORY_LEN]:
+                # 兼容不同字段名
+                period = int(item.get("nbr") or item.get("qh"))
+                number_str = item.get("number") or item.get("pc28")
+                sum_s = int(item.get("num") or item.get("he"))
+                
+                n1, n2, n3 = map(int, number_str.split("+"))
+                pat = get_pattern_by_sum(sum_s)
+                shape = detect_shape([n1, n2, n3])
+                out.append({"period": period, "a": n1, "b": n2, "c": n3, "total": sum_s, "pattern": pat, "shape": shape})
+            
+            if out:
+                out.sort(key=lambda x: x["period"])
+                return out
+        except Exception as e:
+            print(f"接口 {url} 请求失败: {e}")
+            continue
+    return []
 
 def dicts_to_draws(history_data: List[Dict]) -> List[Draw]:
     return [Draw(period=d['period'], nums=[d['a'], d['b'], d['c']], total=d['total'], pattern=d['pattern'], shape=d.get('shape', '杂六')) for d in history_data]
 
-# ============================================================
-#  回测
-# ============================================================
 def backtest(history_data: List[Dict], n_test: int = BACKTEST_N) -> str:
     if len(history_data) < 40: return "历史数据不足"
     start = max(30, len(history_data) - n_test)
@@ -244,9 +233,7 @@ def backtest(history_data: List[Dict], n_test: int = BACKTEST_N) -> str:
         total += 1
     return f"主组命中率: {hits_main/total*100:.1f}%\n副组命中率: {hits_alt/total*100:.1f}%\n双组联合命中率: {hits_both/total*100:.1f}%"
 
-# ============================================================
-#  Bot 核心逻辑
-# ============================================================
+# ==================== Bot 逻辑 ====================
 async def is_user_joined(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = update.effective_user.id
     try:
@@ -293,7 +280,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("⚡ 正在拉取最新数据并计算...")
         history_list = fetch_history_data()
         if not history_list:
-            await q.edit_message_text("❌ 数据拉取失败，请稍后重试")
+            await q.edit_message_text("❌ 数据拉取失败，两个备用接口都连不上，请稍后重试")
             return
         
         pred = V44Predictor(dicts_to_draws(history_list)).predict()
@@ -336,6 +323,11 @@ def run_dummy_server():
     server.serve_forever()
 
 # ══════════ 主入口 ══════════
+async def post_init(app: Application):
+    # 强制清理之前的 Webhook，防止旧消息阻塞
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    print("已清理旧 Webhook")
+
 def main():
     token = os.environ.get("BOT_TOKEN", "").strip()
     if not token:
@@ -344,7 +336,7 @@ def main():
         
     threading.Thread(target=run_dummy_server, daemon=True).start()
     
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
     print("V4.4 Bot 已启动！")
