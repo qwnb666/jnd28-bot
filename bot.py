@@ -18,7 +18,6 @@ from telegram.ext import (
 )
 
 # ==================== 配置 ====================
-# 增加了备用接口，如果主接口挂了自动切换
 API_URLS = [
     "https://pc28.help/api/kj.json?nbr=300",
     "https://jnd28.pw/api/kj?limit=300"
@@ -165,21 +164,36 @@ def pick_two_totals(pattern: str, main_total: int, posterior: Dict[int, float]) 
         if len(sorted_c) > 1: picked.append(sorted_c[1])
     return sorted(picked)
 
-def build_two_group(main_pattern: str, main_total: int, posterior: Dict[int, float]) -> Dict:
+def build_two_and_kill_group(main_pattern: str, main_total: int, posterior: Dict[int, float]) -> Dict:
     all_patterns = ["大双", "大单", "小双", "小单"]
     pattern_scores = {}
+    
+    # 1. 计算除主组外，其他三个形态的最大后验概率
     for p in all_patterns:
         if p == main_pattern: continue
         totals = get_pattern_totals(p)
         pattern_scores[p] = max(posterior.get(t, 0) for t in totals)
-    alt = max(pattern_scores, key=pattern_scores.get)
-
+    
+    # 2. 选出副组（剩余三个中概率最高的）
+    alt_pattern = max(pattern_scores, key=pattern_scores.get)
+    
+    # 3. 剩下的两个形态
+    remaining = [p for p in all_patterns if p != main_pattern and p != alt_pattern]
+    
+    # 4. 只杀一个：杀掉剩余两个中概率最低的那个
+    kill_pattern = min(remaining, key=lambda p: pattern_scores[p])
+    
     main_totals = pick_two_totals(main_pattern, main_total, posterior)
-    alt_totals = pick_two_totals(alt, main_total, posterior)
+    alt_totals = pick_two_totals(alt_pattern, main_total, posterior)
+    
     return {
-        "main_pattern": main_pattern, "alt_pattern": alt,
-        "main_totals": main_totals, "alt_totals": alt_totals,
-        "group_text": f"双组推荐：{main_pattern}({'、'.join(map(str, main_totals))}) / {alt}({'、'.join(map(str, alt_totals))})"
+        "main_pattern": main_pattern, 
+        "alt_pattern": alt_pattern,
+        "kill_pattern": kill_pattern,
+        "main_totals": main_totals, 
+        "alt_totals": alt_totals,
+        "group_text": f"双组推荐：{main_pattern}({'、'.join(map(str, main_totals))}) / {alt_pattern}({'、'.join(map(str, alt_totals))})",
+        "kill_text": f"杀组推荐：{kill_pattern}"
     }
 
 def fetch_history_data() -> List[Dict]:
@@ -187,28 +201,21 @@ def fetch_history_data() -> List[Dict]:
         try:
             res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10, verify=False)
             data = json.loads(res.text)
-            
-            # 兼容两种API的返回格式
             raw_data = data.get("data", [])
             if not raw_data: continue
-            
             out = []
             for item in raw_data[:HISTORY_LEN]:
-                # 兼容不同字段名
                 period = int(item.get("nbr") or item.get("qh"))
                 number_str = item.get("number") or item.get("pc28")
                 sum_s = int(item.get("num") or item.get("he"))
-                
                 n1, n2, n3 = map(int, number_str.split("+"))
                 pat = get_pattern_by_sum(sum_s)
                 shape = detect_shape([n1, n2, n3])
                 out.append({"period": period, "a": n1, "b": n2, "c": n3, "total": sum_s, "pattern": pat, "shape": shape})
-            
             if out:
                 out.sort(key=lambda x: x["period"])
                 return out
-        except Exception as e:
-            print(f"接口 {url} 请求失败: {e}")
+        except Exception:
             continue
     return []
 
@@ -224,7 +231,7 @@ def backtest(history_data: List[Dict], n_test: int = BACKTEST_N) -> str:
         train = history_data[:i]
         actual = history_data[i]['total']
         pred = V44Predictor(dicts_to_draws(train)).predict()
-        two = build_two_group(pred['pattern'], pred['total'], pred['posterior'])
+        two = build_two_and_kill_group(pred['pattern'], pred['total'], pred['posterior'])
         in_main = actual in two['main_totals']
         in_alt = actual in two['alt_totals']
         if in_main: hits_main += 1
@@ -250,7 +257,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     kb = [
-        [InlineKeyboardButton("🎯 预测下期 (V4.4)", callback_data="predict")],
+        [InlineKeyboardButton("🎯 预测下期 (双组+单杀组)", callback_data="predict")],
         [InlineKeyboardButton("🧪 回测最近100期", callback_data="backtest")],
     ]
     await update.message.reply_text("请选择操作类型：", reply_markup=InlineKeyboardMarkup(kb))
@@ -263,7 +270,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data == "check_join":
         if await is_user_joined(update, context):
             kb = [
-                [InlineKeyboardButton("🎯 预测下期 (V4.4)", callback_data="predict")],
+                [InlineKeyboardButton("🎯 预测下期 (双组+单杀组)", callback_data="predict")],
                 [InlineKeyboardButton("🧪 回测最近100期", callback_data="backtest")],
             ]
             await q.edit_message_text("✅ 验证成功！请选择操作类型：", reply_markup=InlineKeyboardMarkup(kb))
@@ -284,16 +291,17 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         pred = V44Predictor(dicts_to_draws(history_list)).predict()
-        two = build_two_group(pred['pattern'], pred['total'], pred['posterior'])
+        res = build_two_and_kill_group(pred['pattern'], pred['total'], pred['posterior'])
         
         latest = history_list[-1]
         text = f"🏰 最新期号：{latest['period']}\n"
         text += f"🏰 开奖号：{latest['a']}+{latest['b']}+{latest['c']}={latest['total']} [{latest['pattern']}]\n\n"
-        text += f"🎯 主组形态(条件概率)：{two['main_pattern']}\n"
-        text += f"🔢 主组特码：{'、'.join(map(str, two['main_totals']))}\n\n"
-        text += f"🎯 副组形态：{two['alt_pattern']}\n"
-        text += f"🔢 副组特码：{'、'.join(map(str, two['alt_totals']))}\n\n"
-        text += f"📌 双组推荐：\n{two['group_text']}\n\n"
+        text += f"🎯 主组形态：{res['main_pattern']}\n"
+        text += f"🔢 主组特码：{'、'.join(map(str, res['main_totals']))}\n\n"
+        text += f"🎯 副组形态：{res['alt_pattern']}\n"
+        text += f"🔢 副组特码：{'、'.join(map(str, res['alt_totals']))}\n\n"
+        text += f"📌 综合建议：\n{res['group_text']}\n"
+        text += f"❌ {res['kill_text']}\n\n"
         text += f"📊 后验Top5和值：{pred['top5_totals']}\n"
         text += "\n⚠️ 纯数学游戏，娱乐参考"
         
@@ -324,9 +332,7 @@ def run_dummy_server():
 
 # ══════════ 主入口 ══════════
 async def post_init(app: Application):
-    # 强制清理之前的 Webhook，防止旧消息阻塞
     await app.bot.delete_webhook(drop_pending_updates=True)
-    print("已清理旧 Webhook")
 
 def main():
     token = os.environ.get("BOT_TOKEN", "").strip()
@@ -339,7 +345,7 @@ def main():
     app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
-    print("V4.4 Bot 已启动！")
+    print("V4.4 Bot (单杀组版) 已启动！")
     app.run_polling()
 
 if __name__ == "__main__":
