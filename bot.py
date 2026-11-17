@@ -3,189 +3,250 @@
 import os
 import json
 import math
-import random
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from decimal import Decimal, getcontext, ROUND_HALF_UP
-from collections import Counter, defaultdict
+from collections import Counter
+from typing import List, Dict, Optional
 
-import httpx
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes
 )
 
-getcontext().prec = 50
-PI = Decimal("3.14159265358979323846264338327950288419716939937510")
-MULT = Decimal("7.30548851")
-LIMIT = Decimal(27)
+# ==================== 配置 ====================
+API_URL = "https://pc28.help/api/kj.json?nbr=300"
+HISTORY_LEN = 300
+BACKTEST_N = 100
+ALPHA = 20.0
 
-API_BASE = "https://jnd28.pw/api/kj?limit={}"
-TEMA_RANGE = list(range(28))
-ALL_TYPES = ["大单", "大双", "小单", "小双"]
-
-# 你的频道
+# ⚠️ 替换成你的频道用户名（带@） ⚠️
 CHANNEL_USERNAME = "@qw888nb" 
 
-# ══════════ 基础 ══════════
-def classify(n):
-    size = "大" if n >= 14 else "小"
-    par = "单" if n % 2 else "双"
-    return size + par
+# ============================================================
+#  理论分布
+# ============================================================
+def build_theoretical_dist() -> Dict[int, float]:
+    dist = {}
+    for total in range(0, 28):
+        cnt = 0
+        for a in range(10):
+            for b in range(10):
+                c = total - a - b
+                if 0 <= c <= 9:
+                    cnt += 1
+        dist[total] = cnt / 1000.0
+    return dist
 
-def charity_compute(a, b, c, S):
-    inner = Decimal(a) + Decimal(b) + Decimal(c) + Decimal(S) * PI
-    val = inner * MULT
-    steps = 0
-    while val > LIMIT:
-        val /= PI
-        steps += 1
-    return int(val), steps
+THEORY = build_theoretical_dist()
 
-# ══════════ 极速异步数据拉取 ══════════
-async def fetch_history():
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        url = API_BASE.format(20)
-        try:
-            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-            obj = resp.json()
-            if obj.get("code") != 0: return None
-            hist = []
-            for item in obj.get("data", []):
-                qh = int(item["qh"])
-                A, B, C = map(int, item["pc28"].split("+"))
-                he = int(item["he"])
-                hist.append((qh, A, B, C, he))
-            return sorted(hist, key=lambda x: x[0])
-        except Exception as e:
-            print(f"API拉取失败: {e}")
-            return None
+# ============================================================
+#  单期开奖数据类
+# ============================================================
+class Draw:
+    def __init__(self, period: int, nums: List[int], total: int,
+                 pattern: str, edge: str = "中", remainder: str = "", shape: str = "杂六"):
+        self.period = period
+        self.a, self.b, self.c = nums[0], nums[1], nums[2]
+        self.nums = nums
+        self.total = total
+        self.pattern = pattern
+        self.edge = edge
+        self.remainder = remainder
+        self.shape = shape
 
-# ══════════ 特码 8 方法 ══════════
-def tema_charity(a, b, c):
-    val = (Decimal(a)/100 + Decimal(b)/100 + Decimal(c)/100 * Decimal(a) + Decimal(b) + Decimal(c))
-    val = val.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    s = str(val); ip, fp = s.split(".")
-    i1 = int(ip[-1]); i2 = int(ip[-2]) if len(ip) >= 2 else 0
-    d1 = int(fp[0]); d2 = int(fp[1])
-    cands = [d1+d2, i1+d1, i2+d2, i1+d2]
-    return [v for v in cands if 0 <= v <= 27]
+# ============================================================
+#  工具函数
+# ============================================================
+def detect_shape(nums: List[int]) -> str:
+    a, b, c = nums[0], nums[1], nums[2]
+    if a == b == c: return '豹子'
+    if a == b or b == c or a == c: return '对子'
+    s = sorted(nums)
+    if s[2] - s[0] == 2 and len(set(s)) == 3: return '顺子'
+    return '杂六'
 
-def tema_bayes(h, alpha=1.0):
-    c = Counter(he for _,_,_,_,he in h); n = sum(c.values())
-    p = {v: (c.get(v,0)+alpha)/(n+alpha*28) for v in TEMA_RANGE}
-    return sorted(p.items(), key=lambda x: x[1], reverse=True)
+def get_pattern_by_sum(s: int) -> str:
+    if s <= 13: return "小单" if s % 2 == 1 else "小双"
+    else: return "大单" if s % 2 == 1 else "大双"
 
-def tema_ewma(h, lam=0.85):
-    n = len(h)
-    w = [lam**(n-1-i) for i in range(n)]; tw = sum(w)
-    p = {v: 0.0 for v in TEMA_RANGE}
-    for i,(_,_,_,_,he) in enumerate(h): p[he] += w[i]/tw
-    return sorted(p.items(), key=lambda x: x[1], reverse=True)
+def get_pattern_totals(pattern: str) -> List[int]:
+    if pattern == "大双": return [14, 16, 18, 20, 22, 24, 26]
+    elif pattern == "大单": return [15, 17, 19, 21, 23, 25, 27]
+    elif pattern == "小双": return [2, 4, 6, 8, 10, 12]
+    elif pattern == "小单": return [1, 3, 5, 7, 9, 11, 13]
+    return [10]
 
-def tema_markov(h, alpha=0.5):
-    if len(h) < 2: return tema_bayes(h)
-    tr = defaultdict(Counter)
-    for i in range(len(h)-1): tr[h[i][4]][h[i+1][4]] += 1
-    row = tr.get(h[-1][4], Counter()); n = sum(row.values())
-    p = {v: (row.get(v,0)+alpha)/(n+alpha*28) for v in TEMA_RANGE}
-    return sorted(p.items(), key=lambda x: x[1], reverse=True)
+# ============================================================
+#  V4.4 预测器
+# ============================================================
+class V44Predictor:
+    def __init__(self, history: List[Draw]):
+        self.history = history
 
-def tema_knn(h, k=10, window=5):
-    if len(h) < window + k: return tema_bayes(h)
-    vals = [he for _,_,_,_,he in h]
-    target = vals[-window:]
-    cands = []
-    for i in range(window, len(vals)):
-        feats = vals[i-window:i]
-        d = math.sqrt(sum((a-b)**2 for a,b in zip(feats, target)))
-        cands.append((d, vals[i]))
-    cands.sort(key=lambda x: x[0])
-    w = Counter()
-    for d, v in cands[:k]: w[v] += 1.0/(d+1e-6)
-    total = sum(w.values()) or 1
-    return sorted([(v, c/total) for v,c in w.items()], key=lambda x: x[1], reverse=True)
+    def _bayesian_weights(self, lookback: Optional[int] = None) -> Dict[int, float]:
+        if lookback is None: lookback = min(100, len(self.history))
+        recent = [r.total for r in self.history[-lookback:]]
+        n = len(recent)
+        if n == 0: return dict(THEORY)
+        freq = Counter(recent)
+        posterior = {}
+        for t in range(1, 28):
+            theo = THEORY.get(t, 0)
+            posterior[t] = (freq.get(t, 0) + ALPHA * theo) / (n + ALPHA)
+        return posterior
 
-def tema_mod(h):
-    a, b, c = h[-1][1], h[-1][2], h[-1][3]
-    S = a + b + c
-    ops = [S%28, (a+b)%28, (b+c)%28, (a+c)%28, (a*b+c)%28, (S*7)%28, abs(a-b)+c, abs(b-c)+a]
-    cnt = Counter(v for v in ops if 0 <= v <= 27)
-    total = sum(cnt.values()) or 1
-    return sorted([(v, c/total) for v,c in cnt.items()], key=lambda x: x[1], reverse=True)
+    def _pattern_conditional(self) -> str:
+        pattern_theory = {
+            "大双": sum(THEORY[t] for t in [14, 16, 18, 20, 22, 24, 26]),
+            "大单": sum(THEORY[t] for t in [15, 17, 19, 21, 23, 25, 27]),
+            "小双": sum(THEORY[t] for t in [2, 4, 6, 8, 10, 12]),
+            "小单": sum(THEORY[t] for t in [1, 3, 5, 7, 9, 11, 13]),
+        }
+        scores = dict(pattern_theory)
+        recent_10 = [r.pattern for r in self.history[-10:]]
+        recent_30 = [r.pattern for r in self.history[-30:]]
+        cnt10 = Counter(recent_10)
+        cnt30 = Counter(recent_30)
+        for p in scores:
+            obs10 = cnt10.get(p, 0) / len(recent_10) if recent_10 else 0
+            obs30 = cnt30.get(p, 0) / len(recent_30) if recent_30 else 0
+            scores[p] = 0.4 * pattern_theory[p] + 0.3 * obs30 + 0.3 * obs10
 
-def tema_kalman(h):
-    if not h: return [(14, 0.04)]
-    x = h[0][4]; P = 1.0
-    for _,_,_,_,he in h[1:]:
-        K = P/(P+1.0)
-        x = x + K*(he-x)
-        P = (1-K)*P + 0.1
-    center = max(0, min(27, int(round(x))))
-    return [(center, 0.5), (max(0,center-1), 0.2), (min(27,center+1), 0.2)]
+        sizes = [r.pattern[0] for r in self.history[-4:]]
+        odds = [r.pattern[1] for r in self.history[-4:]]
+        size_streak = len(sizes) >= 4 and len(set(sizes)) == 1
+        odd_streak = len(odds) >= 4 and len(set(odds)) == 1
+        if size_streak:
+            for p in scores:
+                if p[0] == sizes[-1]: scores[p] *= 0.85
+                else: scores[p] *= 1.08
+        if odd_streak:
+            for p in scores:
+                if p[1] == odds[-1]: scores[p] *= 0.95
+                else: scores[p] *= 1.05
 
-def tema_mc(h, n_sim=1000, seed=42):
-    c = Counter(he for _,_,_,_,he in h); n = sum(c.values())
-    if n == 0: return [(14, 0.04)]
-    p = {v: (c.get(v,0)+1.0)/(n+28) for v in TEMA_RANGE}
-    types = list(p.keys()); weights = [p[v] for v in types]
-    rng = random.Random(seed); sim = Counter()
-    for _ in range(n_sim): sim[rng.choices(types, weights=weights)[0]] += 1
-    return sorted([(v, sim.get(v,0)/n_sim) for v in TEMA_RANGE], key=lambda x: x[1], reverse=True)
+        recent_30_sizes = [r.pattern[0] for r in self.history[-30:]]
+        if recent_30_sizes:
+            big_ratio = recent_30_sizes.count('大') / len(recent_30_sizes)
+            if big_ratio > 0.6:
+                for p in scores:
+                    if p[0] == '大': scores[p] *= 0.85
+                    else: scores[p] *= 1.1
+            elif big_ratio < 0.4:
+                for p in scores:
+                    if p[0] == '小': scores[p] *= 0.85
+                    else: scores[p] *= 1.1
 
-WEIGHTS = {"charity":0.10, "bayes":0.15, "ewma":0.12, "markov":0.12, "knn":0.10, "mod":0.08, "kalman":0.08, "mc":0.10, "uniform":0.15}
+        last_shape = self.history[-1].shape
+        if last_shape == '豹子':
+            for p in scores:
+                if p[0] == '小': scores[p] *= 1.2
+        elif last_shape == '顺子':
+            for p in scores:
+                if p[0] == '小': scores[p] *= 1.1
+        return max(scores, key=scores.get)
 
-def fuse_tema(h):
-    latest = h[-1]
-    methods = {
-        "charity": [(v, 1.0/max(1,len(tema_charity(latest[1],latest[2],latest[3])))) for v in tema_charity(latest[1],latest[2],latest[3])],
-        "bayes":  tema_bayes(h), "ewma":   tema_ewma(h), "markov": tema_markov(h),
-        "knn":    tema_knn(h), "mod":    tema_mod(h), "kalman": tema_kalman(h),
-        "mc":     tema_mc(h), "uniform":[(v, 1/28) for v in TEMA_RANGE],
+    def predict(self) -> Dict:
+        if len(self.history) < 5:
+            return {'total': 14, 'pattern': '大双', 'top5_totals': [13, 14, 15]}
+        posterior = self._bayesian_weights()
+        main_pattern = self._pattern_conditional()
+        candidates = get_pattern_totals(main_pattern)
+        best_total = max(candidates, key=lambda t: posterior.get(t, 0))
+        top5 = sorted(posterior.items(), key=lambda x: -x[1])[:5]
+        top5_totals = [t for t, _ in top5]
+        return {
+            'total': best_total, 'pattern': main_pattern,
+            'top5_totals': top5_totals, 'posterior': {t: round(posterior[t], 4) for t in range(1, 28)}
+        }
+
+# ============================================================
+#  特码选择 + 双组
+# ============================================================
+def pick_two_totals(pattern: str, main_total: int, posterior: Dict[int, float]) -> List[int]:
+    candidates = get_pattern_totals(pattern)
+    if not candidates: return [main_total]
+    sorted_c = sorted(candidates, key=lambda t: -posterior.get(t, 0))
+    picked = [sorted_c[0]]
+    span = max(candidates) - min(candidates)
+    min_gap = max(2, span // 4)
+    for t in sorted_c[1:]:
+        if abs(t - picked[0]) >= min_gap:
+            picked.append(t)
+            break
+    else:
+        if len(sorted_c) > 1: picked.append(sorted_c[1])
+    return sorted(picked)
+
+def build_two_group(main_pattern: str, main_total: int, posterior: Dict[int, float]) -> Dict:
+    all_patterns = ["大双", "大单", "小双", "小单"]
+    pattern_scores = {}
+    for p in all_patterns:
+        if p == main_pattern: continue
+        totals = get_pattern_totals(p)
+        pattern_scores[p] = max(posterior.get(t, 0) for t in totals)
+    alt = max(pattern_scores, key=pattern_scores.get)
+
+    main_totals = pick_two_totals(main_pattern, main_total, posterior)
+    alt_totals = pick_two_totals(alt, main_total, posterior)
+    return {
+        "main_pattern": main_pattern, "alt_pattern": alt,
+        "main_totals": main_totals, "alt_totals": alt_totals,
+        "group_text": f"双组推荐：{main_pattern}({'、'.join(map(str, main_totals))}) / {alt}({'、'.join(map(str, alt_totals))})"
     }
-    fused = {v: 0.0 for v in TEMA_RANGE}
-    for name, items in methods.items():
-        w = WEIGHTS.get(name, 0)
-        total = sum(p for _,p in items) or 1
-        for v, p in items: fused[v] += w * (p/total)
-    total = sum(fused.values()) or 1
-    return sorted([(v, p/total) for v,p in fused.items()], key=lambda x: x[1], reverse=True)
 
-def dual_group(h):
-    latest, prev, prev2 = h[-1], h[-2], h[-3]
-    n, _ = charity_compute(latest[1], prev[2], prev2[3], latest[4])
-    base = classify(n)
-    s, p = base[0], base[1]
-    d = n % 10
-    same = [s+"单", s+"双"] if d <= 4 else ["大"+p, "小"+p]
-    dim = "大小" if d <= 4 else "单双"
-    guard = [t for t in same if t != base][0]
-    return {"main": base, "guard": guard, "dim": dim, "n": n}
+# ============================================================
+#  数据获取与转换
+# ============================================================
+def fetch_history_data() -> List[Dict]:
+    try:
+        res = requests.get(API_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=15, verify=False)
+        data = json.loads(res.text)
+        out = []
+        for item in data["data"][:HISTORY_LEN]:
+            period = int(item["nbr"])
+            n1, n2, n3 = map(int, item["number"].split("+"))
+            sum_s = int(item["num"])
+            pat = get_pattern_by_sum(sum_s)
+            shape = detect_shape([n1, n2, n3])
+            out.append({"period": period, "a": n1, "b": n2, "c": n3, "total": sum_s, "pattern": pat, "shape": shape})
+        out.sort(key=lambda x: x["period"])
+        return out
+    except Exception as e:
+        print(f"获取数据失败: {e}")
+        return []
 
-def miss_streak(h, top_n=1, lookback=12):
-    base = top_n/28.0
-    streak = 0
-    for i in range(len(h)-1, max(0, len(h)-lookback-1), -1):
-        train = h[:i]
-        if len(train) < 10: break
-        top = [v for v,_ in fuse_tema(train)[:top_n]]
-        if h[i][4] in top: break
-        streak += 1
-    prob = (1-base)**streak if streak > 0 else 1.0
-    return {"streak": streak, "prob": prob, "base": base}
+def dicts_to_draws(history_data: List[Dict]) -> List[Draw]:
+    return [Draw(period=d['period'], nums=[d['a'], d['b'], d['c']], total=d['total'], pattern=d['pattern'], shape=d.get('shape', '杂六')) for d in history_data]
 
-# ══════════ Bot 核心逻辑 ══════════
-CACHE = {"history": None, "ts": 0}
+# ============================================================
+#  回测
+# ============================================================
+def backtest(history_data: List[Dict], n_test: int = BACKTEST_N) -> str:
+    if len(history_data) < 40: return "历史数据不足"
+    start = max(30, len(history_data) - n_test)
+    hits_main = hits_alt = hits_both = 0
+    total = 0
+    for i in range(start, len(history_data)):
+        train = history_data[:i]
+        actual = history_data[i]['total']
+        pred = V44Predictor(dicts_to_draws(train)).predict()
+        two = build_two_group(pred['pattern'], pred['total'], pred['posterior'])
+        in_main = actual in two['main_totals']
+        in_alt = actual in two['alt_totals']
+        if in_main: hits_main += 1
+        if in_alt: hits_alt += 1
+        if in_main or in_alt: hits_both += 1
+        total += 1
+    return f"主组命中率: {hits_main/total*100:.1f}%\n副组命中率: {hits_alt/total*100:.1f}%\n双组联合命中率: {hits_both/total*100:.1f}%"
 
-async def get_history():
-    import time
-    if CACHE["history"] is None or time.time() - CACHE["ts"] > 120:
-        h = await fetch_history()
-        if h:
-            CACHE["history"] = h
-            CACHE["ts"] = time.time()
-    return CACHE["history"]
-
+# ============================================================
+#  Bot 核心逻辑
+# ============================================================
 async def is_user_joined(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = update.effective_user.id
     try:
@@ -202,12 +263,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     kb = [
-        [InlineKeyboardButton("🎯 特码 Top-6", callback_data="tema6")],
-        [InlineKeyboardButton("🎯 特码 Top-3", callback_data="tema3")],
-        [InlineKeyboardButton("🔪 双组/杀组", callback_data="dual")],
-        [InlineKeyboardButton("📉 连挂分析", callback_data="streak")],
+        [InlineKeyboardButton("🎯 预测下期 (V4.4)", callback_data="predict")],
+        [InlineKeyboardButton("🧪 回测最近100期", callback_data="backtest")],
     ]
-    await update.message.reply_text("请选择分析类型：", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("请选择操作类型：", reply_markup=InlineKeyboardMarkup(kb))
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -217,12 +276,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data == "check_join":
         if await is_user_joined(update, context):
             kb = [
-                [InlineKeyboardButton("🎯 特码 Top-6", callback_data="tema6")],
-                [InlineKeyboardButton("🎯 特码 Top-3", callback_data="tema3")],
-                [InlineKeyboardButton("🔪 双组/杀组", callback_data="dual")],
-                [InlineKeyboardButton("📉 连挂分析", callback_data="streak")],
+                [InlineKeyboardButton("🎯 预测下期 (V4.4)", callback_data="predict")],
+                [InlineKeyboardButton("🧪 回测最近100期", callback_data="backtest")],
             ]
-            await q.edit_message_text("✅ 验证成功！请选择：", reply_markup=InlineKeyboardMarkup(kb))
+            await q.edit_message_text("✅ 验证成功！请选择操作类型：", reply_markup=InlineKeyboardMarkup(kb))
         else:
             try: await q.answer("❌ 验证失败，请先加入频道！", show_alert=True)
             except: pass
@@ -232,37 +289,41 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("⚠️ 请先加入频道后再使用！发送 /start 重新验证。")
         return
 
-    await q.edit_message_text("⚡ 极速计算中...")
-    h = await get_history()
-    
-    if not h or len(h) < 5:
-        await q.edit_message_text("❌ 数据拉取失败或期数不足，请稍后重试")
-        return
+    if q.data == "predict":
+        await q.edit_message_text("⚡ 正在拉取最新数据并计算...")
+        history_list = fetch_history_data()
+        if not history_list:
+            await q.edit_message_text("❌ 数据拉取失败，请稍后重试")
+            return
+        
+        pred = V44Predictor(dicts_to_draws(history_list)).predict()
+        two = build_two_group(pred['pattern'], pred['total'], pred['posterior'])
+        
+        latest = history_list[-1]
+        text = f"🏰 最新期号：{latest['period']}\n"
+        text += f"🏰 开奖号：{latest['a']}+{latest['b']}+{latest['c']}={latest['total']} [{latest['pattern']}]\n\n"
+        text += f"🎯 主组形态(条件概率)：{two['main_pattern']}\n"
+        text += f"🔢 主组特码：{'、'.join(map(str, two['main_totals']))}\n\n"
+        text += f"🎯 副组形态：{two['alt_pattern']}\n"
+        text += f"🔢 副组特码：{'、'.join(map(str, two['alt_totals']))}\n\n"
+        text += f"📌 双组推荐：\n{two['group_text']}\n\n"
+        text += f"📊 后验Top5和值：{pred['top5_totals']}\n"
+        text += "\n⚠️ 纯数学游戏，娱乐参考"
+        
+        await q.edit_message_text(text)
 
-    latest = h[-1]
-    header = f"最新期 {latest[0]}\n{latest[1]}+{latest[2]}+{latest[3]}={latest[4]}（{classify(latest[4])}）\n\n"
+    elif q.data == "backtest":
+        await q.edit_message_text("🧪 正在拉取历史数据并进行回测，请稍候...")
+        history_list = fetch_history_data()
+        if not history_list:
+            await q.edit_message_text("❌ 数据拉取失败，请稍后重试")
+            return
+        
+        bt_result = backtest(history_list, n_test=BACKTEST_N)
+        text = f"📊 最近 {BACKTEST_N} 期回测结果：\n\n{bt_result}\n\n⚠️ 历史表现不代表未来"
+        await q.edit_message_text(text)
 
-    if q.data == "tema6":
-        ranked = fuse_tema(h)
-        text = header + "🎯 特码 Top-6\n\n"
-        for i, (v, p) in enumerate(ranked[:6], 1): text += f"{i}. 特码 {v}（{classify(v)}）\n"
-    elif q.data == "tema3":
-        ranked = fuse_tema(h)
-        text = header + "🎯 特码 Top-3\n\n"
-        for i, (v, p) in enumerate(ranked[:3], 1): text += f"{i}. 特码 {v}（{classify(v)}）\n"
-    elif q.data == "dual":
-        dg = dual_group(h)
-        text = header + f"🔪 双组分析\n\n维度：{dg['dim']}\n主推：{dg['main']}\n防守：{dg['guard']}\n\n理论基准：50%"
-    elif q.data == "streak":
-        s1 = miss_streak(h, top_n=1)
-        text = header + f"📉 连挂分析\n\nTop-1：连挂 {s1['streak']} 期\n随机下出现概率 {s1['prob']*100:.1f}%"
-    else: text = "未知操作"
-
-    text += "\n\n⚠️ 基准不变，算法不提高长期命中率"
-    await q.edit_message_text(text)
-
-
-# ══════════ 适配 Render 的假 Web 服务器 ══════════
+# ══════════ 适配 Railway 的假 Web 服务器 ══════════
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -281,15 +342,12 @@ def main():
         print("错误：未找到 BOT_TOKEN 环境变量！")
         return
         
-    # 启动假 Web 服务器（在后台运行，防止 Render 报无端口错误）
     threading.Thread(target=run_dummy_server, daemon=True).start()
     
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
-    print("Bot 已启动！")
-    
-    # 启动 Telegram 机器人
+    print("V4.4 Bot 已启动！")
     app.run_polling()
 
 if __name__ == "__main__":
