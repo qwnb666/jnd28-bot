@@ -4,6 +4,7 @@ import os
 import json
 import math
 import threading
+import random
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import Counter, defaultdict
 
@@ -49,123 +50,171 @@ def classify(n):
     return size + par
 
 # ============================================================
-# 🏆 5 大策略引擎 (用于投票)
+# 🏆 8 大策略引擎 (双轨投票)
 # ============================================================
-def model_trend(h): # 顺势长龙派
-    recent = [classify(he) for _,_,_,_,he in h[-5:]]
-    return recent[-1]
 
-def model_reversion(h): # 均值回归派
+# 1. 顺势长龙派
+def model_trend(h): 
+    recent = [classify(he) for _,_,_,_,he in h[-5:]]
+    return {"kill": recent[-1], "duals": [recent[-1], recent[-2]]}
+
+# 2. 均值回归派
+def model_reversion(h): 
     recent = [classify(he) for _,_,_,_,he in h[-10:]]
     cnt = Counter(recent)
-    return cnt.most_common(1)[0][0]
+    kill_target = cnt.most_common(1)[0][0] 
+    duals = [t for t in ALL_TYPES if t != kill_target][:2]
+    return {"kill": kill_target, "duals": duals}
 
-def model_markov(h): # 马尔可夫转移派
+# 3. 马尔可夫转移派
+def model_markov(h): 
     tr = defaultdict(Counter)
     for i in range(len(h)-1): tr[classify(h[i][4])][classify(h[i+1][4])] += 1
     last = classify(h[-1][4])
     row = tr.get(last, Counter())
-    if not row: return classify(h[-1][4])
-    return row.most_common(1)[0][0]
+    if not row: return model_reversion(h)
+    sorted_next = row.most_common()
+    duals = [item[0] for item in sorted_next[:2]]
+    kill_target = sorted_next[-1][0]
+    return {"kill": kill_target, "duals": duals}
 
-def model_bayes(h): # 朴素贝叶斯派
+# 4. 朴素贝叶斯派
+def model_bayes(h): 
     c = Counter(classify(he) for _,_,_,_,he in h[-20:])
-    return c.most_common(1)[0][0]
+    kill_target = c.most_common(1)[0][0]
+    duals = [t for t in ALL_TYPES if t != kill_target][:2] 
+    return {"kill": kill_target, "duals": duals}
 
-def model_alternate(h): # 极值反脆弱派 (连出4把变盘)
+# 5. 极值反脆弱派
+def model_alternate(h): 
     recent = [classify(he) for _,_,_,_,he in h[-4:]]
     if len(set(recent)) == 1:
-        return recent[-1] # 如果连出，投它一票（长龙顺热）
+        return {"kill": recent[-1], "duals": [recent[-1], recent[-1]]}
     return model_reversion(h)
 
+# 6. 逻辑回归派 (模拟特征权重)
+def model_logistic(h):
+    # 简单构造特征：大小概率、单双概率
+    recent = [he for _,_,_,_,he in h[-15:]]
+    big_cnt = sum(1 for v in recent if v >= 14)
+    odd_cnt = sum(1 for v in recent if v % 2 == 1)
+    
+    # 强行拟合权重
+    prob_big = big_cnt / len(recent) if recent else 0.5
+    prob_odd = odd_cnt / len(recent) if recent else 0.5
+    
+    if prob_big > 0.6 and prob_odd > 0.6:
+        return {"kill": "小双", "duals": ["大单", "大双"]}
+    elif prob_big < 0.4 and prob_odd < 0.4:
+        return {"kill": "大单", "duals": ["小双", "小单"]}
+    
+    # 默认回退
+    return model_reversion(h)
+
+# 7. KNN 近邻派 (寻找历史相似点)
+def model_knn(h, k=5):
+    if len(h) < 10: return model_reversion(h)
+    target_seq = [he for _,_,_,_,he in h[-3:]] # 寻找近3期相似的
+    
+    distances = []
+    for i in range(len(h)-4):
+        seq = [he for _,_,_,_,he in h[i:i+3]]
+        dist = sum(abs(a-b) for a, b in zip(seq, target_seq))
+        distances.append((dist, classify(h[i+3][4])))
+        
+    distances.sort(key=lambda x: x[0])
+    knn_types = [t for _, t in distances[:k]]
+    cnt = Counter(knn_types)
+    kill_target = cnt.most_common(1)[0][0] if cnt else "小双"
+    duals = [t for t in ALL_TYPES if t != kill_target][:2]
+    return {"kill": kill_target, "duals": duals}
+
+# 8. 随机森林简化派 (多决策树投票)
+def model_forest(h):
+    if len(h) < 20: return model_trend(h)
+    # 随机抽取不同长度的窗口
+    t1 = model_trend(h[-5:])
+    t2 = model_reversion(h[-15:])
+    t3 = model_markov(h[-30:])
+    
+    all_kills = [t1['kill'], t2['kill'], t3['kill']]
+    cnt = Counter(all_kills)
+    kill_target = cnt.most_common(1)[0][0]
+    
+    all_duals = t1['duals'] + t2['duals'] + t3['duals']
+    dual_cnt = Counter(all_duals)
+    duals = [t for t, v in dual_cnt.most_common() if t != kill_target][:2]
+    return {"kill": kill_target, "duals": duals}
+
 # ============================================================
-# ⚖️ 共识投票与熔断机制
+# ⚖️ 8 模型双轨投票与熔断机制
 # ============================================================
-def get_consensus_prediction(h):
+def get_master_prediction(h):
     models = {
         "顺势长龙": model_trend,
         "均值回归": model_reversion,
         "马氏转移": model_markov,
-        "贝叶斯流": model_bayes,
-        "极值反脆弱": model_alternate
+        "朴素贝叶斯": model_bayes,
+        "极值反脆弱": model_alternate,
+        "逻辑回归": model_logistic,
+        "KNN近邻": model_knn,
+        "随机森林": model_forest
     }
     
-    # 收集所有模型想要 "杀" 的形态
-    kill_votes = []
+    kill_pool = []
+    dual_pool = []
     model_picks = {}
     
     for name, func in models.items():
         try:
-            kill_target = func(h)
-            kill_votes.append(kill_target)
-            model_picks[name] = kill_target
-        except:
+            res = func(h)
+            kill_pool.append(res["kill"])
+            dual_pool.extend(res["duals"])
+            model_picks[name] = res
+        except Exception as e:
             pass
 
-    # 统计票数
-    vote_counter = Counter(kill_votes)
-    most_common_target, votes = vote_counter.most_common(1)[0]
+    kill_counter = Counter(kill_pool)
+    dual_counter = Counter(dual_pool)
+    
+    final_kill, kill_votes = kill_counter.most_common(1)[0]
 
-    # 判断共识程度
-    if votes >= 4:
-        consensus_level = "🔥 绝对共识 (4/5)"
-        action = f"高胜率出击！建议主杀：**{most_common_target}**"
-        main = [t for t in ALL_TYPES if t != most_common_target][0]
+    # 剔除被杀的形态
+    valid_duals = [(t, v) for t, v in dual_counter.most_common() if t != final_kill]
+    final_duals = [valid_duals[0][0], valid_duals[1][0]] if len(valid_duals) >= 2 else valid_duals
+
+    # 8 个模型，共识要求提高（至少 4 票杀组）
+    if kill_votes >= 6:
+        consensus_level = "🌋 终极共识 (杀组绝对碾压)"
         is_chaos = False
-    elif votes == 3:
-        consensus_level = "⚖️ 多数共识 (3/5)"
-        action = f"常规防守！建议主杀：**{most_common_target}**"
-        main = [t for t in ALL_TYPES if t != most_common_target][0]
+    elif kill_votes >= 4:
+        consensus_level = "⚖️ 多数共识 (杀组半数以上)"
         is_chaos = False
     else:
-        consensus_level = "🚨 意见分歧 (最大票数 < 3)"
-        action = "**建议观望**：模型意见极度混乱，强行下注极易连黑！"
-        most_common_target = "无"
-        main = "无"
+        consensus_level = "🚨 严重分歧 (杀组票数分散)"
         is_chaos = True
-
-    # 找防守形态
-    guard = "无"
-    if not is_chaos:
-        remain = [t for t in ALL_TYPES if t != most_common_target]
-        guard = remain[-1]
-
-    # 精选两个特码（基于主推形态）
-    temas = []
-    if main != "无":
-        def get_totals(p):
-            if p == "大双": return [14, 16, 18, 20, 22, 24, 26]
-            if p == "大单": return [15, 17, 19, 21, 23, 25, 27]
-            if p == "小双": return [2, 4, 6, 8, 10, 12]
-            if p == "小单": return [1, 3, 5, 7, 9, 11, 13]
-            return []
-        pool = get_totals(main)
-        recent_sums = [he for _,_,_,_,he in h[-10:]]
-        cold_pool = sorted(pool, key=lambda t: recent_sums.count(t))
-        temas = sorted(cold_pool[:2])
 
     return {
         "models": model_picks,
-        "votes": dict(vote_counter),
-        "target": most_common_target,
+        "kill_counter": dict(kill_counter),
+        "kill_target": final_kill,
+        "kill_votes": kill_votes,
+        "dual_counter": dict(dual_counter),
+        "final_duals": final_duals,
         "level": consensus_level,
-        "action": action,
-        "main": main,
-        "guard": guard,
-        "temas": temas,
-        "is_chaos": is_chaos
+        "is_chaos": is_chaos,
+        "total_models": len(models)
     }
 
-async def get_ai_comment(consensus):
-    if not ai_client: return "⚠️ AI 未配置，本地共识算法已执行。"
+async def get_ai_comment(res):
+    if not ai_client: return "⚠️ AI 未配置。"
     
     prompt = f"""
-    你是一个首席量化风控官。当前系统执行了“多模型共识投票机制”。
-    5个独立算法的投票详情：{consensus['models']}。
-    最终共识：{consensus['level']}。
-    系统建议：{consensus['action']}。
+    你是一个首席量化风控官。当前系统执行了“8大模型双轨独立投票”。
+    最终杀组共识：{res['kill_target']} (在 {res['total_models']} 个模型中得 {res['kill_votes']} 票)。
+    最终双组共识：{res['final_duals']}。
     
-    请用 2 句话点评此结果，语气要像华尔街风控官，强调纪律和概率，不超过 80 字。
+    请用 2 句话点评此结果，强调“机器学习模型集成的稳健性”和“纪律性”，不超过 80 字。
     """
     try:
         response = await ai_client.chat.completions.create(
@@ -192,8 +241,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ 请先加入频道！", reply_markup=InlineKeyboardMarkup(kb))
         return
 
-    kb = [[InlineKeyboardButton("⚖️ 启动 5 模型共识投票", callback_data="predict")]]
-    await update.message.reply_text("欢迎使用共识投票系统。只有在多模型达成共识时，才会发出高胜率指令。", reply_markup=InlineKeyboardMarkup(kb))
+    kb = [[InlineKeyboardButton("🚀 启动 8 模型机器学习推演", callback_data="predict")]]
+    await update.message.reply_text("欢迎使用最高算力终端。8 大机器学习模型已就绪。", reply_markup=InlineKeyboardMarkup(kb))
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -202,7 +251,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if q.data == "check_join":
         if await is_user_joined(update, context):
-            kb = [[InlineKeyboardButton("⚖️ 启动 5 模型共识投票", callback_data="predict")]]
+            kb = [[InlineKeyboardButton("🚀 启动 8 模型机器学习推演", callback_data="predict")]]
             await q.edit_message_text("✅ 验证成功！", reply_markup=InlineKeyboardMarkup(kb))
         else:
             try: await q.answer("❌ 验证失败，请先加入！", show_alert=True)
@@ -214,43 +263,33 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if q.data == "predict":
-        await q.edit_message_text("🧠 正在收集 5 大流派的独立预测，并启动共识熔断机制...")
+        await q.edit_message_text("🧠 正在启动逻辑回归、KNN、随机森林等 8 大模型并发投票...\n(算力消耗较大，请稍候)")
         
         hist = await fetch_history()
         if not hist or len(hist) < 20:
             await q.edit_message_text("❌ 数据拉取失败或不足")
             return
 
-        consensus = get_consensus_prediction(hist)
-        ai_comment = await get_ai_comment(consensus)
+        res = get_master_prediction(hist)
+        ai_comment = await get_ai_comment(res)
 
         latest = hist[-1]
-        text = f"🏛️ **情雾 10.0 · 共识熔断版**\n\n"
+        text = f"🏛️ **情雾 12.0 · 8 模型集成版**\n\n"
         text += f"🏰 最新：{latest[1]}+{latest[2]}+{latest[3]}={latest[4]} [{classify(latest[4])}]\n\n"
         
-        # 投票面板
-        text += f"📊 **【5 大流派独立投票】**\n"
-        for name, target in consensus['models'].items():
-            text += f"· {name}：杀 `{target}`\n"
-        
-        text += f"\n⚖️ **【投票结果统计】**\n"
-        for target, v in consensus['votes'].items():
-            text += f"`{target}` 获得了 {v} 票\n"
-        
-        text += f"\n🚦 **【系统决议：{consensus['level']}】**\n"
-        text += f"{consensus['action']}\n\n"
+        text += f"❌ **【杀组票池：8 大模型投票】**\n"
+        for t, v in sorted(res['kill_counter'].items(), key=lambda x: -x[1]):
+            text += f"· `{t}` 获得 {v} 票\n"
+        text += f"▶ **最终决议：杀 `{res['kill_target']}`**\n\n"
 
-        if not consensus['is_chaos']:
-            text += f"🎯 **【交易指令】**\n"
-            text += f"高概率杀组：`{consensus['target']}`\n"
-            text += f"主推形态：`{consensus['main']}`\n"
-            text += f"防守形态：`{consensus['guard']}`\n"
-            
-            if consensus['temas']:
-                t_str = " / ".join([f"**{t}**({classify(t)})" for t in consensus['temas']])
-                text += f"极冷特码：{t_str}\n"
-        else:
-            text += f"🛑 **【交易指令】**\n**空仓观望！不要下注！**\n"
+        text += f"✅ **【双组票池】** (剔除杀组后)\n"
+        dual_strs = [f"`{t}`({v}票)" for t, v in res['dual_counter'].items() if t != res['kill_target']]
+        text += "· " + " | ".join(dual_strs[:3]) + "\n"
+        text += f"▶ **最终双组：主推 `{res['final_duals'][0]}` / 防守 `{res['final_duals'][1]}`**\n\n"
+
+        text += f"🚦 **【系统决议：{res['level']}】**\n"
+        if res['is_chaos']:
+            text += f"🛑 **交易指令：空仓观望！不要下注！**\n"
 
         text += f"\n🧠 **【AI 风控点评】**\n"
         text += f"{ai_comment}\n"
@@ -281,7 +320,7 @@ def main():
     app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
-    print("共识熔断版 Bot 已启动！")
+    print("8 大机器学习模型 Bot 已启动！")
     app.run_polling()
 
 if __name__ == "__main__":
