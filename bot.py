@@ -14,11 +14,9 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes
 )
 
-# ⚠️ 你的频道
 CHANNEL_USERNAME = "@qw888nb" 
 ALL_TYPES = ["大单", "大双", "小单", "小双"]
 
-# 🤖 初始化 AI 客户端
 AI_API_KEY = os.environ.get("AI_API_KEY", "").strip()
 ai_client = AsyncOpenAI(api_key=AI_API_KEY, base_url="https://api.deepseek.com") if AI_API_KEY else None
 
@@ -51,97 +49,134 @@ def classify(n):
     return size + par
 
 # ============================================================
-#  🛡️ 核心策略：降维防反猎杀模型
+# 🏆 5 大策略引擎 (用于投票)
 # ============================================================
-def get_strategy(h):
-    if len(h) < 20:
-        return {"error": "历史数据不足，无法执行降维策略"}
+def model_trend(h): # 顺势长龙派
+    recent = [classify(he) for _,_,_,_,he in h[-5:]]
+    return recent[-1]
 
-    # 近 10 期和 30 期形态统计
-    recent_10 = [classify(he) for _,_,_,_,he in h[-10:]]
-    recent_30 = [classify(he) for _,_,_,_,he in h[-30:]]
-    cnt_10 = Counter(recent_10)
-    cnt_30 = Counter(recent_30)
-    
-    last_type = recent_10[-1]
-    
-    # 1. 检测长龙（连号）
-    streak = 0
-    for t in reversed(recent_10):
-        if t == last_type:
-            streak += 1
-        else:
-            break
-            
-    # 2. 寻找“极热”与“极冷”
-    hottest_30 = cnt_30.most_common(1)[0][0]
-    coldest_30 = min(ALL_TYPES, key=lambda t: cnt_30.get(t, 0))
+def model_reversion(h): # 均值回归派
+    recent = [classify(he) for _,_,_,_,he in h[-10:]]
+    cnt = Counter(recent)
+    return cnt.most_common(1)[0][0]
 
-    # 3. 制定杀组策略
-    # 逻辑 A：如果连出 >= 4 把，直接杀另外两个形态（防长龙断点），绝不抄底。
-    # 逻辑 B：如果没有长龙，顺着 30 期最热的杀（顺热策略），或者杀最冷的（均值回归）。
-    if streak >= 4:
-        kill_patterns = [t for t in ALL_TYPES if t != last_type and t != recent_10[-2]]
-        strategy_desc = f"【长龙预警】已连出 {streak} 把 {last_type}，模型强制顺热，杀无关形态。"
+def model_markov(h): # 马尔可夫转移派
+    tr = defaultdict(Counter)
+    for i in range(len(h)-1): tr[classify(h[i][4])][classify(h[i+1][4])] += 1
+    last = classify(h[-1][4])
+    row = tr.get(last, Counter())
+    if not row: return classify(h[-1][4])
+    return row.most_common(1)[0][0]
+
+def model_bayes(h): # 朴素贝叶斯派
+    c = Counter(classify(he) for _,_,_,_,he in h[-20:])
+    return c.most_common(1)[0][0]
+
+def model_alternate(h): # 极值反脆弱派 (连出4把变盘)
+    recent = [classify(he) for _,_,_,_,he in h[-4:]]
+    if len(set(recent)) == 1:
+        return recent[-1] # 如果连出，投它一票（长龙顺热）
+    return model_reversion(h)
+
+# ============================================================
+# ⚖️ 共识投票与熔断机制
+# ============================================================
+def get_consensus_prediction(h):
+    models = {
+        "顺势长龙": model_trend,
+        "均值回归": model_reversion,
+        "马氏转移": model_markov,
+        "贝叶斯流": model_bayes,
+        "极值反脆弱": model_alternate
+    }
+    
+    # 收集所有模型想要 "杀" 的形态
+    kill_votes = []
+    model_picks = {}
+    
+    for name, func in models.items():
+        try:
+            kill_target = func(h)
+            kill_votes.append(kill_target)
+            model_picks[name] = kill_target
+        except:
+            pass
+
+    # 统计票数
+    vote_counter = Counter(kill_votes)
+    most_common_target, votes = vote_counter.most_common(1)[0]
+
+    # 判断共识程度
+    if votes >= 4:
+        consensus_level = "🔥 绝对共识 (4/5)"
+        action = f"高胜率出击！建议主杀：**{most_common_target}**"
+        main = [t for t in ALL_TYPES if t != most_common_target][0]
+        is_chaos = False
+    elif votes == 3:
+        consensus_level = "⚖️ 多数共识 (3/5)"
+        action = f"常规防守！建议主杀：**{most_common_target}**"
+        main = [t for t in ALL_TYPES if t != most_common_target][0]
+        is_chaos = False
     else:
-        # 杀掉最热门的那个形态（因为热门形态被过度消耗）
-        kill_target = hottest_30
-        kill_patterns = [kill_target]
-        strategy_desc = f"【均值回归】近期 {kill_target} 出现过于频繁，模型判定其将被冷却。"
+        consensus_level = "🚨 意见分歧 (最大票数 < 3)"
+        action = "**建议观望**：模型意见极度混乱，强行下注极易连黑！"
+        most_common_target = "无"
+        main = "无"
+        is_chaos = True
 
-    # 4. 制定双组策略（从剩下的里面挑，避开连号和极冷）
-    remain_types = [t for t in ALL_TYPES if t not in kill_patterns]
-    
-    # 选出主推（近期偏热，但不是最热）和防守（近期偏冷，准备反弹）
-    remain_types.sort(key=lambda t: cnt_10.get(t, 0), reverse=True)
-    main_type = remain_types[0]
-    guard_type = remain_types[-1] if len(remain_types) > 1 else remain_types[0]
+    # 找防守形态
+    guard = "无"
+    if not is_chaos:
+        remain = [t for t in ALL_TYPES if t != most_common_target]
+        guard = remain[-1]
 
-    # 5. 特码精选（只出 2 个，降低难度）
-    # 在主推形态里，找前 30 期最冷的两个和值
-    def get_pattern_totals(pattern):
-        if pattern == "大双": return [14, 16, 18, 20, 22, 24, 26]
-        if pattern == "大单": return [15, 17, 19, 21, 23, 25, 27]
-        if pattern == "小双": return [2, 4, 6, 8, 10, 12]
-        if pattern == "小单": return [1, 3, 5, 7, 9, 11, 13]
-        return []
-        
-    pool = get_pattern_totals(main_type)
-    recent_30_sums = [he for _,_,_,_,he in h[-30:]]
-    cold_pool = sorted(pool, key=lambda t: recent_30_sums.count(t))
-    top2_totals = sorted(cold_pool[:2]) # 拿最冷的两个
+    # 精选两个特码（基于主推形态）
+    temas = []
+    if main != "无":
+        def get_totals(p):
+            if p == "大双": return [14, 16, 18, 20, 22, 24, 26]
+            if p == "大单": return [15, 17, 19, 21, 23, 25, 27]
+            if p == "小双": return [2, 4, 6, 8, 10, 12]
+            if p == "小单": return [1, 3, 5, 7, 9, 11, 13]
+            return []
+        pool = get_totals(main)
+        recent_sums = [he for _,_,_,_,he in h[-10:]]
+        cold_pool = sorted(pool, key=lambda t: recent_sums.count(t))
+        temas = sorted(cold_pool[:2])
 
     return {
-        "streak": streak,
-        "kill": kill_patterns,
-        "main": main_type,
-        "guard": guard_type,
-        "totals": top2_totals,
-        "desc": strategy_desc,
-        "cnt_30": dict(cnt_30)
+        "models": model_picks,
+        "votes": dict(vote_counter),
+        "target": most_common_target,
+        "level": consensus_level,
+        "action": action,
+        "main": main,
+        "guard": guard,
+        "temas": temas,
+        "is_chaos": is_chaos
     }
 
-async def get_ai_comment(strategy):
-    if not ai_client: return "⚠️ 未配置 AI_API_KEY，本地算法已执行。"
-    prompt = f"""
-    你是一个实战派量化博彩分析师。当前模型执行了“降维防守策略”。
-    当前盘面：近30期形态频次统计 {strategy['cnt_30']}。
-    当前连号状态：连出 {strategy['streak']} 把。
-    策略动作：杀 {strategy['kill']}，主推 {strategy['main']}，防守 {strategy['guard']}。
-    精选特码：{strategy['totals']}。
+async def get_ai_comment(consensus):
+    if not ai_client: return "⚠️ AI 未配置，本地共识算法已执行。"
     
-    请用 3 句话点评这个策略逻辑，语言要犀利、冷静，强调“防守大于预测”，结尾附带风险提示。不超过 100 字。
+    prompt = f"""
+    你是一个首席量化风控官。当前系统执行了“多模型共识投票机制”。
+    5个独立算法的投票详情：{consensus['models']}。
+    最终共识：{consensus['level']}。
+    系统建议：{consensus['action']}。
+    
+    请用 2 句话点评此结果，语气要像华尔街风控官，强调纪律和概率，不超过 80 字。
     """
     try:
         response = await ai_client.chat.completions.create(
-            model="deepseek-chat", messages=[{"role": "user", "content": prompt}], temperature=0.7, max_tokens=200
+            model="deepseek-chat", messages=[{"role": "user", "content": prompt}], temperature=0.5, max_tokens=150
         )
         return response.choices[0].message.content.strip()
     except:
         return "⚠️ AI 连接超时。"
 
 # ============================================================
-#  Bot 逻辑
+# Bot 逻辑
 # ============================================================
 async def is_user_joined(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
@@ -157,8 +192,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ 请先加入频道！", reply_markup=InlineKeyboardMarkup(kb))
         return
 
-    kb = [[InlineKeyboardButton("🛡️ 获取降维防守策略", callback_data="predict")]]
-    await update.message.reply_text("请选择操作。当前为【降维防反猎杀版】，主打高胜率防守。", reply_markup=InlineKeyboardMarkup(kb))
+    kb = [[InlineKeyboardButton("⚖️ 启动 5 模型共识投票", callback_data="predict")]]
+    await update.message.reply_text("欢迎使用共识投票系统。只有在多模型达成共识时，才会发出高胜率指令。", reply_markup=InlineKeyboardMarkup(kb))
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -167,7 +202,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if q.data == "check_join":
         if await is_user_joined(update, context):
-            kb = [[InlineKeyboardButton("🛡️ 获取降维防守策略", callback_data="predict")]]
+            kb = [[InlineKeyboardButton("⚖️ 启动 5 模型共识投票", callback_data="predict")]]
             await q.edit_message_text("✅ 验证成功！", reply_markup=InlineKeyboardMarkup(kb))
         else:
             try: await q.answer("❌ 验证失败，请先加入！", show_alert=True)
@@ -179,46 +214,51 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if q.data == "predict":
-        await q.edit_message_text("⚡ 正在分析长龙与形态频次...")
+        await q.edit_message_text("🧠 正在收集 5 大流派的独立预测，并启动共识熔断机制...")
         
         hist = await fetch_history()
         if not hist or len(hist) < 20:
-            await q.edit_message_text("❌ 数据拉取失败或不足 20 期，请稍后重试")
+            await q.edit_message_text("❌ 数据拉取失败或不足")
             return
 
-        strategy = get_strategy(hist)
-        if "error" in strategy:
-            await q.edit_message_text(f"❌ {strategy['error']}")
-            return
-
-        ai_comment = await get_ai_comment(strategy)
+        consensus = get_consensus_prediction(hist)
+        ai_comment = await get_ai_comment(consensus)
 
         latest = hist[-1]
-        text = f"📡 **情雾 · 降维防反猎杀版**\n\n"
-        text += f"🏰 最新：{latest[1]}+{latest[2]}+{latest[3]}={latest[4]} [{classify(latest[4])}]\n"
-        text += f"📊 走势判断：{strategy['desc']}\n\n"
+        text = f"🏛️ **情雾 10.0 · 共识熔断版**\n\n"
+        text += f"🏰 最新：{latest[1]}+{latest[2]}+{latest[3]}={latest[4]} [{classify(latest[4])}]\n\n"
         
-        text += f"🧠 **【AI 策略点评】**\n"
-        text += f"{ai_comment}\n\n"
-
-        kill_str = " / ".join(strategy['kill'])
-        text += f"❌ **【杀组区间】**\n必杀：`{kill_str}` *(高胜率防守)*\n\n"
-
-        text += f"🎯 **【双组防守】**\n"
-        text += f"主推：`{strategy['main']}`\n"
-        text += f"防守：`{strategy['guard']}`\n\n"
-
-        text += f"🔮 **【精选双特码】**\n"
-        t_str = " / ".join([f"**{t}**({classify(t)})" for t in strategy['totals']])
-        text += f"{t_str}\n"
-        text += f"*(从主推形态中精选极冷号)*\n\n"
+        # 投票面板
+        text += f"📊 **【5 大流派独立投票】**\n"
+        for name, target in consensus['models'].items():
+            text += f"· {name}：杀 `{target}`\n"
         
-        text += f"⚠️ *策略仅为防守参考。如果模型连黑，请立即停手观望！*"
+        text += f"\n⚖️ **【投票结果统计】**\n"
+        for target, v in consensus['votes'].items():
+            text += f"`{target}` 获得了 {v} 票\n"
+        
+        text += f"\n🚦 **【系统决议：{consensus['level']}】**\n"
+        text += f"{consensus['action']}\n\n"
+
+        if not consensus['is_chaos']:
+            text += f"🎯 **【交易指令】**\n"
+            text += f"高概率杀组：`{consensus['target']}`\n"
+            text += f"主推形态：`{consensus['main']}`\n"
+            text += f"防守形态：`{consensus['guard']}`\n"
+            
+            if consensus['temas']:
+                t_str = " / ".join([f"**{t}**({classify(t)})" for t in consensus['temas']])
+                text += f"极冷特码：{t_str}\n"
+        else:
+            text += f"🛑 **【交易指令】**\n**空仓观望！不要下注！**\n"
+
+        text += f"\n🧠 **【AI 风控点评】**\n"
+        text += f"{ai_comment}\n"
         
         await q.edit_message_text(text, parse_mode="Markdown")
 
 # ============================================================
-#  假 Web 服务器防休眠 + 主入口
+# Web Server & Main
 # ============================================================
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -241,7 +281,7 @@ def main():
     app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
-    print("降维防反猎杀版 Bot 已启动！")
+    print("共识熔断版 Bot 已启动！")
     app.run_polling()
 
 if __name__ == "__main__":
